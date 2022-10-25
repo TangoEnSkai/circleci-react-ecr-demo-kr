@@ -1,0 +1,155 @@
+# This configures the CircleCI config.yml version.
+# Currently, 2.1 is the latest version.
+version: 2.1
+
+###############################################################################
+##### Orbs ####################################################################
+###############################################################################
+
+# Orbs are reusable packages of pipeline configuration maintained
+# by CircleCI, our partners, or our community.
+orbs:
+  # docs: https://circleci.com/developer/orbs/orb/circleci/aws-ecr
+  aws-ecr: circleci/aws-ecr@8.1.2
+  # docs: https://circleci.com/developer/orbs/orb/circleci/browser-tools
+  browser-tools: circleci/browser-tools@1.4.0
+  # docs: https://circleci.com/developer/orbs/orb/circleci/node
+  node: circleci/node@5.0.3
+  # docs: https://github.com/CircleCI-Public/slack-orb/wiki
+  slack: circleci/slack@4.10
+
+
+###############################################################################
+##### YAML Anchors ############################################################
+###############################################################################
+
+# These are YAML anchors.  They allow use to reuse the same bits of YAML in our pipeline config, keeping it dry.
+slack_notify_cci_fail: &slack_notify_cci_fail
+  slack/notify:
+    channel: cci-demo
+    event: fail # this will trigger the slack notification when job status is fail
+    template: basic_fail_1
+slack_notify_cci_success: &slack_notify_cci_success
+  slack/notify:
+    channel: cci-demo
+    event: pass # this will trigger the slack notification when job status is success
+    template: basic_success_1
+slack_notify_cci_deploy_success: &slack_notify_cci_deploy_success
+  slack/notify:
+    channel: cci-demo
+    event: pass # this will trigger the slack notification when job status is success
+    template: success_tagged_deploy_1
+slack_notify_cci_deploy_fail: &slack_notify_cci_deploy_fail
+  slack/notify:
+    channel: cci-demo
+    event: fail # this will trigger the slack notification when job status is fail
+    template: success_tagged_deploy_1
+
+
+###############################################################################
+##### Workflows ###############################################################
+###############################################################################
+
+# Workflows specify the logic according to which the jobs should be run.
+workflows:
+  test-and-deploy:
+    jobs:
+      - dependencies
+      - node/test:
+          requires:
+            - dependencies
+          app-dir: "~/project/frontend"
+          version: 18.8.0
+          name: unit-test
+          run-command: test:ci
+          test-results-path: frontend/junit.xml # for uploading test results.
+          post-steps:
+            - *slack_notify_cci_fail
+            - *slack_notify_cci_success
+      - e2e-test-parallel:
+          requires:
+            - dependencies
+      - lint:
+          requires:
+            - dependencies
+      - slack/on-hold:
+          requires:
+            - unit-test
+            - lint
+          name: on-hold-notification
+      - need-approval:
+          requires:
+            - on-hold-notification
+          type: approval
+      - deploy:
+          context:
+            - aws-deploy
+          requires:
+            - need-approval
+ 
+###############################################################################
+##### Jobs ####################################################################
+###############################################################################
+
+# This is an unordered list of jobs that CircleCI will run in this pipeline.
+jobs:
+  dependencies:
+    docker:
+      - image: cimg/node:18.10.0
+    steps:
+      - checkout
+      - node/install-packages:
+          app-dir: "~/project/frontend"
+          pkg-manager: npm
+      - persist_to_workspace:
+          root: ~/project/frontend
+          paths: .
+      - *slack_notify_cci_success
+      - *slack_notify_cci_fail
+  
+  lint:
+    docker:
+      - image: cimg/node:18.10.0
+    steps:
+      - attach_workspace:
+          at: ~/project/frontend
+      - run:
+          name: "run eslint"
+          command: |
+            frontend/node_modules/.bin/eslint frontend/src
+      - *slack_notify_cci_success
+      - *slack_notify_cci_fail
+
+  e2e-test-parallel:
+    parallelism: 10
+    docker:
+      - image: cimg/node:16.18.0-browsers
+    resource_class: large # Docker resource class
+    working_directory: frontend
+    steps:
+      - attach_workspace:
+          at: ~/project/frontend
+      - browser-tools/install-chrome
+      - run: |
+          TEST_FILES=$(circleci tests glob "e2e/*.spec.ts" | circleci tests split --split-by=timings)
+          echo ${TEST_FILES}
+          npm run e2e -file=$TEST_FILES
+
+  # docs: deploy to aws ecr/ecs https://circleci.com/docs/ecs-ecr
+  deploy:
+    machine:
+      docker_layer_caching: true
+      resource_class: arm.large
+      image: ubuntu-2004:current
+    steps:
+      # Build and push the Docker image to AWS ECR
+      - aws-ecr/build-and-push-image:
+          assume-web-identity: true
+          create-repo: true
+          role-arn: "arn:aws:iam::${AWS_ACCOUNT_ID}:role/${AWS_ROLE_NAME}"
+          platform: linux/arm64 # arm64 Docker image
+          repo: "${AWS_REPO_NAME}"
+          tag: "${CIRCLE_SHA1}-arm64"
+          region: "${AWS_REGION}"
+      - *slack_notify_cci_deploy_success
+      - *slack_notify_cci_deploy_fail
